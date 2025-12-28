@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# data
+t15_pretrained_rnn_baseline/
+t15_copyTask_neuralData/
+brain-to-text-25.zip 
+data_link.txt
