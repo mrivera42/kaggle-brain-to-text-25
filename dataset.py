@@ -25,13 +25,12 @@ class NeuralDataset(torch.utils.data.Dataset):
 
                     entry = {'filepath': path, 'trial': i}
                     self.index.append(entry)
-
     
     def __len__(self): 
 
         return len(self.index)
     
-    def __get_item__(self, idx): 
+    def __getitem__(self, idx): 
 
         file_path, trial_name = self.index[idx]['filepath'], self.index[idx]['trial']
 
