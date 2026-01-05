@@ -17,7 +17,7 @@ class NeuralDataset(torch.utils.data.Dataset):
 
             if filename in files: 
 
-                path = os.join(folder, filename) 
+                path = os.path.join(folder, filename) 
                 f = h5py.File(path)
 
                 for i in list(f.keys()):       
