@@ -17,6 +17,11 @@ import torch.distributed as dist
 import time 
 import json
 
+from dataset import NeuralDataset
+from rnn import BaselineLSTM 
+import matplotlib.pyplot as plt 
+
+
 # each gpu runs one process 
 # setting up a group is necessary so that gpus can discover and communicate with eachother 
 # world size = total number of processes in a group 
@@ -105,72 +110,7 @@ def load_h5py_file(file_path):
 
 
 
-class NeuralDataset(torch.utils.data.Dataset): 
 
-    def __init__(self, dir):
-        
-        self.data = {
-            'neural_features': [],
-            'n_time_steps': [],
-            'seq_class_ids': [], 
-            'seq_len': [], 
-            'transcription': [], 
-            'sentence_label': [], 
-            'session': [], 
-            'block_num': [], 
-            'trial_num': []
-        }
-
-        for folder, __, files in os.walk(dir): 
-
-            if 'data_train.hdf5' in files: 
-
-                # load file 
-                f = h5py.File(os.path.join(folder, 'data_train.hdf5'))
-
-                # loop through trials 
-                for i in list(f.keys()): 
-
-                    trial = f[i]
-
-                    neural_features = trial['input_features'][:]
-                    n_time_steps = trial.attrs['n_time_steps']
-                    seq_class_ids = trial['seq_class_ids'][:] if 'seq_class_ids' in trial else None
-                    seq_len = trial.attrs['seq_len'] if 'seq_len' in trial.attrs else None
-                    transcription = trial['transcription'][:] if 'transcription' in trial else None
-                    sentence_label = trial.attrs['sentence_label'][:] if 'sentence_label' in trial.attrs else None
-                    session = trial.attrs['session']
-                    block_num = trial.attrs['block_num']
-                    trial_num = trial.attrs['trial_num']
-
-                    # append trial features to data list 
-                    self.data['neural_features'].append(neural_features)
-                    self.data['n_time_steps'].append(n_time_steps)
-                    self.data['seq_class_ids'].append(seq_class_ids)
-                    self.data['seq_len'].append(seq_len)
-                    self.data['transcription'].append(transcription)
-                    self.data['sentence_label'].append(sentence_label)
-                    self.data['session'].append(session)
-                    self.data['block_num'].append(block_num)
-                    self.data['trial_num'].append(trial_num)
-
-    def __len__(self): 
-
-        return len(self.data['neural_features'])
-
-    def __getitem__(self, idx): 
-
-        return {
-            'neural_features': torch.tensor(self.data['neural_features'][idx]),
-            'n_time_steps': torch.tensor(self.data['n_time_steps'][idx]),
-            'seq_class_ids': torch.tensor(self.data['seq_class_ids'][idx]),
-            'seq_len': torch.tensor(self.data['seq_len'][idx]),
-            'transcription': self.data['transcription'][idx],
-            'sentence_label': self.data['sentence_label'][idx],
-            'session': self.data['session'][idx],
-            'block_num': self.data['block_num'][idx],
-            'trial_num': self.data['trial_num'][idx]
-        }
 
 
 
@@ -190,14 +130,6 @@ def collate_fn(batch):
     session = [i['session'] for i in batch]
     block_num = [i['block_num'] for i in batch]
     trial_num = [i['trial_num'] for i in batch]
-    # neural_lengths = [len(i) for i in neural_features]
-    # seq_class_lengths = [len(i) for i in seq_class_ids]
-
-    # max_neural_idx = np.argmax(neural_lengths)
-    # max_seq_class_idx = np.argmax(seq_class_lengths)
-
-    # max_neural_len = neural_lengths[max_neural_idx]
-    # max_seq_len = seq_class_lengths[max_seq_class_idx]
 
     neural_features_padded = pad_sequence(neural_features, batch_first=True, padding_value=0)
     seq_class_ids_padded = pad_sequence(seq_class_ids, batch_first=True, padding_value=0)
@@ -214,28 +146,10 @@ def collate_fn(batch):
         'trial_num': trial_num
     }
 
-class BaselineLSTM(torch.nn.Module):
-
-    def __init__(self):
-
-        super().__init__()
-
-        # input (B x T x 512) --> output (B x T x 41)
-
-        self.rnn = torch.nn.LSTM(input_size=512,hidden_size=768, num_layers=5)
-        self.proj = torch.nn.Linear(in_features=768, out_features=41)
-
-
-    def forward(self, x): 
-        # print('rnn input: ', x.shape)
-        x, _ = self.rnn(x)
-        # print('linear input: ', x.shape)
-        x = F.log_softmax(self.proj(x),dim=2)
-
-        return x 
+ 
 
 # define training loop 
-def train(model, dataloader, rank):
+def train(model, trainloader, valloader, rank):
 
     print(f'starting training loop on device {rank}')
     start_time = time.time()
@@ -244,18 +158,23 @@ def train(model, dataloader, rank):
     lr = 1e-5
     optimizer = optim.SGD(params=model.parameters(), lr=lr)
     loss_fn = torch.nn.CTCLoss()
-    num_epochs = 100
+    num_epochs = 2
+    patience = 3
 
     model.train()
 
     epoch_loss = 0
     train_losses = []
+    val_losses = []
+    early_stopping_counter = 0
+    best_val = -100
     for epoch in range(num_epochs):
 
         
         train_loss = 0
-        num_batches = len(dataloader)
-        for i, batch in enumerate(dataloader):
+        num_batches = len(trainloader)
+        num_val_batches = len(valloader)
+        for i, batch in enumerate(trainloader):
 
             # place tensors on device
             inputs, targets = batch['neural_features'].to(rank), batch['seq_class_ids'].to(rank)
@@ -276,7 +195,7 @@ def train(model, dataloader, rank):
             # compute loss 
             loss = loss_fn(output, targets, input_lengths, target_lengths)
             train_loss += loss.item()
-            train_losses.append(train_loss)
+            
 
             # backprop 
             loss.backward()
@@ -285,15 +204,84 @@ def train(model, dataloader, rank):
             optimizer.step()
         
         train_loss /= num_batches 
+        train_losses.append(train_loss)
+
+        # switch to eval mode 
+        if rank == 0:
+            model.eval()
+            val_loss = 0 
+            for i, batch in enumerate(valloader): 
+
+                # put data onto device 
+                inputs, targets = batch['neural_features'].to(rank), batch['seq_class_ids'].to(rank)
+                inputs = torch.transpose(inputs, 0, 1) # ctc loss expects this for some reason
+
+                # forward 
+                with torch.no_grad():
+
+                    output = model(inputs)
+
+                # compute loss 
+                input_lengths, target_lengths = torch.tensor(batch['n_time_steps']).to(rank), torch.tensor(batch['seq_len']).to(rank)
+                loss = loss_fn(output, targets, input_lengths, target_lengths)
+
+                val_loss += loss.item()
+
+            val_loss /= num_val_batches
+            val_losses.append(val_loss)
+            curr_val = val_loss
+
+            # early stopping 
+            if curr_val < best_val:
+                best_val = curr_val 
+            
+            if curr_val > best_val:
+                early_stopping_counter += 1 
+            
+            if early_stopping_counter > patience and rank == 0:
+
+                print(f'early stopping initiated: early_stopping_counter: {early_stopping_counter}, patience: {patience}')
+
+            # save model 
+            state_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
+            cpu_state = {k: v.cpu() for k,v in state_dict.items()}
+            torch.save({'model_state_dict': cpu_state, 'metadata': metadata}, 'checkpoint.pt')
+
+            # save metadata 
+            with open('train_metadata.json', 'w') as f: 
+                json.dump(metadata, f, indent=2)
+
+
+            # print out stats for this epoch 
+            end_time = time.time()
+            epoch_duration = (end_time - start_time) / 60
+            print(f'Epoch {epoch} train loss: {train_loss:.2f}, val loss: {val_loss:.2f}, took: {epoch_duration:.2f} minutes')
+
+            # save training plot 
+            train_losses.append(train_loss)
+            
+            # stop training 
+            return model, metadata
+
 
         if rank == 0:
             end_time = time.time()
             epoch_duration = (end_time - start_time) / 60
-            print(f'Epoch {epoch} loss: {train_loss:.2f}, took: {epoch_duration:.2f} minutes')
+            print(f'Epoch {epoch} train loss: {train_loss:.2f}, val loss: {val_loss:.2f}, took: {epoch_duration:.2f} minutes')
 
     metadata['num_epochs'] = num_epochs
     metadata['lr'] = lr 
     metadata['train_losses'] = train_losses
+
+    if rank == 0: 
+
+        plt.plot(train_losses, label='train')
+        plt.plot(val_losses, label='val')
+        plt.xlabel('epoch')
+        plt.ylabel('ctc loss')
+        plt.legend()
+        plt.savefig('losses.png')
+        plt.close()
 
     return model, metadata
 
@@ -307,16 +295,26 @@ def worker(rank, world_size):
 
     filepath = 't15_copyTask_neuralData/hdf5_data_final'
 
-    brainDataset = NeuralDataset(filepath)
+    print('about to load datasets')
 
-    sampler = DistributedSampler(dataset=brainDataset, num_replicas=world_size, rank=rank, shuffle=True)
+    trainDataset = NeuralDataset(filepath)
+    print('loaded train set')
+    valDataset = NeuralDataset(filepath,val=True)
+    print('loaded val set')
 
-    trainLoader = DataLoader(brainDataset, batch_size=32, shuffle=False, collate_fn=collate_fn, sampler=sampler)
-    
+    print('about to create dataloaders')
+    trainSampler = DistributedSampler(dataset=trainDataset, num_replicas=world_size, rank=rank, shuffle=True)
+    valSampler = DistributedSampler(dataset=valDataset,num_replicas=world_size, rank=rank, shuffle=True)
+    trainLoader = DataLoader(trainDataset, batch_size=1, shuffle=False, collate_fn=collate_fn, sampler=trainSampler)
+    print('finished trainloader')
+    valLoader = DataLoader(valDataset,batch_size=1, shuffle=False, collate_fn=collate_fn, sampler=valSampler)
+    print('finished val loader')
+
     model = BaselineLSTM().to(rank)
     model = DDP(model,device_ids=[rank])
+    print('initialized model')
 
-    model, metadata = train(model, trainLoader, rank)
+    model, metadata = train(model, trainLoader, valLoader, rank)
     
     if rank == 0: 
 
@@ -344,7 +342,11 @@ if __name__ == "__main__":
     
     world_size = 2
     start_time = time.time()
-    mp.spawn(worker, nprocs=world_size, args=(world_size,))
+    try:
+        mp.spawn(worker, nprocs=world_size, args=(world_size,))
+    except KeyboardInterrupt:
+        cleanup()
+        torch.cuda.empty_cache()
     end_time = time.time()
     duration = (end_time - start_time) / 60 
     print(f'Total training time: {duration:.2f} minutes')
